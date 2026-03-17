@@ -8,7 +8,7 @@
 # What this script does:
 #   1. Creates a Python 3.10 virtual environment in .venv/
 #   2. Installs all dependencies from requirements.txt
-#   3. Pre-downloads the XTTS v2 model weights via Coqui TTS CLI
+#   3. Pre-downloads the Qwen3-TTS model weights from HuggingFace
 #   4. Downloads the NLTK punkt tokenizer data
 
 set -euo pipefail
@@ -39,27 +39,22 @@ echo "      Pip    : $(pip --version)"
 echo "[2/4] Installing dependencies from requirements.txt …"
 pip install --upgrade pip wheel setuptools --quiet
 pip install -r requirements.txt
-# Note: coqui-tts is the community-maintained fork of coqui-ai/TTS that
-# supports Python 3.12+.  It is a drop-in replacement — all imports remain
-# the same (from TTS.api import TTS).
 
-# ── 3. Download XTTS v2 model ─────────────────────────────────────
-echo "[3/4] Pre-downloading Coqui XTTS v2 model weights …"
-echo "      (This is ~2 GB on first run; subsequent runs are instant.)"
+# ── 3. Download Qwen3-TTS model ───────────────────────────────────
+echo "[3/4] Pre-downloading Qwen3-TTS model weights from HuggingFace …"
+echo "      (This is ~3.5 GB on first run; subsequent runs are instant.)"
 python - <<'PYEOF'
-from TTS.api import TTS
-import os, sys
-
-model_name = "tts_models/multilingual/multi-dataset/xtts_v2"
-print(f"  Downloading: {model_name}")
+import sys
 try:
-    # Passing agree_to_terms=True avoids interactive prompts in CI.
-    os.environ["COQUI_TOS_AGREED"] = "1"
-    tts = TTS(model_name=model_name, progress_bar=True, gpu=False)
-    print("  XTTS v2 ready.")
+    from qwen_tts import Qwen3TTSModel
+    import torch
+    model_id = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+    print(f"  Downloading: {model_id}")
+    Qwen3TTSModel.from_pretrained(model_id, device_map="cpu", dtype=torch.float32)
+    print("  Qwen3-TTS ready.")
 except Exception as exc:
-    print(f"  WARNING: Could not download XTTS v2 ({exc}).")
-    print("  The engine will fall back to tacotron2-DDC at runtime.")
+    print(f"  WARNING: Could not download Qwen3-TTS model ({exc}).")
+    print("  The model will be downloaded automatically on first synthesis run.")
     sys.exit(0)
 PYEOF
 

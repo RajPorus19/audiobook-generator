@@ -66,7 +66,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(
         prog="audiobook-tts",
-        description="Convert text to a human-like audiobook narration using Coqui XTTS v2.",
+        description="Convert text to a human-like audiobook narration using Qwen3-TTS.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(

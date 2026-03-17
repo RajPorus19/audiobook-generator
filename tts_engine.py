@@ -1,17 +1,19 @@
 """
-TTS Engine — Core wrapper around Coqui TTS (XTTS v2).
+TTS Engine — Core wrapper around Qwen3-TTS.
 
-Why Coqui TTS over alternatives:
+Why Qwen3-TTS over alternatives:
   - gTTS / pyttsx3: robotic quality, no voice cloning, online dependency for gTTS.
   - Amazon Polly / ElevenLabs: cloud API — requires network, costs money, data leaves device.
   - Bark (suno-ai): high quality but extremely slow, no deterministic voice cloning.
-  - Coqui TTS: fully local, Apache-2.0, state-of-the-art naturalness, supports XTTS v2.
+  - Coqui TTS (XTTS v2): outdated, less natural prosody.
+  - Qwen3-TTS: fully local, Apache-2.0, state-of-the-art naturalness, voice cloning from 3s.
 
-Why XTTS v2 specifically:
-  - Neural codec language model conditioned on a speaker reference — voice stays identical
-    across every chunk because the conditioning embedding is fixed.
-  - 17-language support, cross-lingual voice cloning, 24 kHz output.
-  - Temperature / repetition-penalty controls allow reproducible, consistent prosody.
+Model variants (all under Qwen/Qwen3-TTS-12Hz-*):
+  - 1.7B-CustomVoice : predefined speakers + style instructions (default, no ref audio needed).
+  - 1.7B-Base        : voice cloning from a short reference WAV (~3 s is enough).
+  - 0.6B-CustomVoice : lighter variant for low-VRAM setups.
+
+The 1.7B-Base model is used automatically when a speaker_wav is supplied.
 """
 
 import logging
@@ -25,13 +27,18 @@ import torch
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Generation constants — MUST NOT be changed per-chunk to guarantee
-# voice and prosody consistency across the entire audiobook.
+# Constants
 # ---------------------------------------------------------------------------
-_TEMPERATURE: float = 0.65
-_REPETITION_PENALTY: float = 2.5
-_LENGTH_PENALTY: float = 1.0
+_SAMPLE_RATE: int = 24_000
 _TORCH_SEED: int = 42
+
+# Default voice used when no reference WAV is provided.
+_DEFAULT_SPEAKER: str = "aiden"
+_DEFAULT_INSTRUCTION: str = "Warm, natural, storytelling tone. Calm and engaging."
+
+# HuggingFace model IDs
+_MODEL_CUSTOM_VOICE = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+_MODEL_VOICE_CLONE = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 
 
 def _detect_device() -> str:
@@ -51,41 +58,44 @@ def _detect_device() -> str:
 
 
 class TTSEngine:
-    """Wrapper around Coqui TTS XTTS v2 for audiobook synthesis.
+    """Wrapper around Qwen3-TTS for audiobook synthesis.
 
-    The model is loaded exactly once at construction time. A speaker embedding
-    is extracted from the reference WAV once and reused for every chunk, which
-    is the key mechanism that guarantees a consistent voice throughout.
+    Two operating modes:
+      - CustomVoice (default): uses a named built-in speaker with an optional
+        style instruction.  No reference audio required.
+      - Voice cloning: when ``speaker_wav`` is supplied, loads the Base model
+        and conditions generation on the reference clip every call.
+
+    The model is loaded exactly once at construction time.
 
     Attributes:
-        sample_rate: Output sample rate reported by the loaded model.
+        sample_rate: Output sample rate (always 24 000 Hz for Qwen3-TTS).
     """
-
-    # Primary model — best quality, cross-lingual voice cloning.
-    _PRIMARY_MODEL = "tts_models/multilingual/multi-dataset/xtts_v2"
-    # Fallback if primary cannot be loaded (e.g. first-run download fails).
-    _FALLBACK_MODEL = "tts_models/en/ljspeech/vits"
 
     def __init__(
         self,
         speaker_wav: Optional[str] = None,
         language: str = "en",
         speed: float = 1.0,
+        speaker: str = _DEFAULT_SPEAKER,
+        instruction: str = _DEFAULT_INSTRUCTION,
     ) -> None:
-        """Initialise the TTS engine and optionally extract a speaker embedding.
+        """Initialise the TTS engine.
 
         Args:
-            speaker_wav: Path to a 6–30 second clean-speech WAV file used for
-                voice cloning.  Optional — if omitted a default XTTS speaker is
-                used.
+            speaker_wav: Path to a ≥3 second reference WAV for voice cloning.
+                Optional — if omitted the built-in ``speaker`` voice is used.
             language: BCP-47 language code, e.g. 'en', 'fr', 'de'.
+                Informational only; Qwen3-TTS is multilingual by default.
             speed: Speech-rate multiplier in [0.7, 1.3].
+            speaker: Named speaker for CustomVoice mode (ignored when
+                ``speaker_wav`` is provided).
+            instruction: Natural-language style prompt for CustomVoice mode.
 
         Raises:
-            FileNotFoundError: If speaker_wav is given but does not exist.
-            RuntimeError: If neither the primary nor the fallback model loads.
+            FileNotFoundError: If ``speaker_wav`` is given but does not exist.
+            RuntimeError: If the qwen-tts package is not installed.
         """
-        # Deterministic seed — set before any model weights are loaded.
         random.seed(_TORCH_SEED)
         torch.manual_seed(_TORCH_SEED)
         if torch.cuda.is_available():
@@ -95,9 +105,8 @@ class TTSEngine:
         self._speed = max(0.7, min(1.3, speed))
         self._device = _detect_device()
         self._speaker_wav: Optional[str] = None
-        self._gpt_cond_latent: Optional[torch.Tensor] = None
-        self._speaker_embedding: Optional[torch.Tensor] = None
-        self._use_xtts: bool = True
+        self._speaker = speaker
+        self._instruction = instruction
 
         if speaker_wav is not None:
             path = Path(speaker_wav)
@@ -105,78 +114,50 @@ class TTSEngine:
                 raise FileNotFoundError(f"speaker_wav not found: {speaker_wav}")
             self._speaker_wav = str(path.resolve())
 
-        self._tts = self._load_model()
-        self.sample_rate: int = self._tts.synthesizer.output_sample_rate
-
-        if self._use_xtts and self._speaker_wav:
-            self._extract_speaker_embedding()
+        self._model = self._load_model()
+        self.sample_rate: int = _SAMPLE_RATE
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
     def _load_model(self):  # type: ignore[return]
-        """Load the Coqui TTS model, falling back gracefully on error.
+        """Load the appropriate Qwen3-TTS model variant.
 
         Returns:
-            A loaded ``TTS`` instance.
+            A loaded ``Qwen3TTSModel`` instance.
 
         Raises:
-            RuntimeError: If both primary and fallback loading fail.
+            RuntimeError: If the qwen-tts package is not installed.
         """
-        # Import here so that the rest of the module is importable even if TTS
-        # is not installed (useful for unit-testing the text / audio layers).
         try:
-            from TTS.api import TTS  # type: ignore[import]
+            from qwen_tts import Qwen3TTSModel  # type: ignore[import]
         except ImportError as exc:
             raise RuntimeError(
-                "Coqui TTS is not installed. Run: pip install TTS"
+                "qwen-tts is not installed. Run: pip install qwen-tts soundfile"
             ) from exc
 
-        gpu = self._device == "cuda"
+        model_id = _MODEL_VOICE_CLONE if self._speaker_wav else _MODEL_CUSTOM_VOICE
 
-        logger.info("Loading primary TTS model: %s", self._PRIMARY_MODEL)
-        try:
-            model = TTS(model_name=self._PRIMARY_MODEL, progress_bar=True, gpu=gpu)
-            self._use_xtts = True
-            logger.info("XTTS v2 loaded successfully.")
-            return model
-        except Exception as primary_exc:  # noqa: BLE001
-            logger.warning(
-                "Primary model failed (%s). Falling back to %s.",
-                primary_exc,
-                self._FALLBACK_MODEL,
-            )
+        # bfloat16 is the recommended dtype for CUDA; float32 for CPU/MPS.
+        dtype = torch.bfloat16 if self._device == "cuda" else torch.float32
 
-        try:
-            model = TTS(model_name=self._FALLBACK_MODEL, progress_bar=True, gpu=gpu)
-            self._use_xtts = False
-            logger.info("Fallback model loaded successfully.")
-            return model
-        except Exception as fallback_exc:  # noqa: BLE001
-            raise RuntimeError(
-                f"Both TTS models failed to load. "
-                f"Primary: {primary_exc}. Fallback: {fallback_exc}."
-            ) from fallback_exc
+        # device_map format expected by Qwen3TTSModel.from_pretrained
+        if self._device == "cuda":
+            device_map = "cuda:0"
+        elif self._device == "mps":
+            device_map = "mps:0"
+        else:
+            device_map = "cpu"
 
-    def _extract_speaker_embedding(self) -> None:
-        """Extract and cache the GPT conditioning latent and speaker embedding.
-
-        This is called once at startup. The cached tensors are reused for every
-        ``synthesize`` call to guarantee voice consistency.
-        """
-        logger.info(
-            "Extracting speaker embedding from: %s", self._speaker_wav
+        logger.info("Loading Qwen3-TTS model: %s  (device=%s)", model_id, device_map)
+        model = Qwen3TTSModel.from_pretrained(
+            model_id,
+            device_map=device_map,
+            dtype=dtype,
         )
-        # Access the underlying XTTS model through the TTS wrapper.
-        xtts_model = self._tts.synthesizer.tts_model  # type: ignore[attr-defined]
-        (
-            self._gpt_cond_latent,
-            self._speaker_embedding,
-        ) = xtts_model.get_conditioning_latents(
-            audio_path=[self._speaker_wav],
-        )
-        logger.info("Speaker embedding extracted and cached.")
+        logger.info("Qwen3-TTS model loaded successfully.")
+        return model
 
     # ------------------------------------------------------------------
     # Public API
@@ -198,76 +179,20 @@ class TTSEngine:
         if not text.strip():
             raise ValueError("Cannot synthesize empty text.")
 
-        if self._use_xtts:
-            return self._synthesize_xtts(text)
-        return self._synthesize_fallback(text)
-
-    def _default_speaker(self) -> str:
-        """Return the first available built-in XTTS speaker name.
-
-        Returns:
-            A speaker name string suitable for passing to ``tts.tts(speaker=...)``.
-
-        Raises:
-            RuntimeError: If the model reports no speakers.
-        """
-        speakers = self._tts.speakers  # type: ignore[attr-defined]
-        if not speakers:
-            raise RuntimeError("XTTS v2 reported no built-in speakers.")
-        return speakers[0]
-
-    def _synthesize_xtts(self, text: str) -> np.ndarray:
-        """Synthesize using XTTS v2 with fixed speaker conditioning.
-
-        Args:
-            text: Input text chunk.
-
-        Returns:
-            Float32 NumPy array of audio samples.
-        """
-        xtts_model = self._tts.synthesizer.tts_model  # type: ignore[attr-defined]
-
-        if self._gpt_cond_latent is not None and self._speaker_embedding is not None:
-            # Use the pre-extracted, fixed speaker embedding.
-            out = xtts_model.inference(
+        if self._speaker_wav:
+            wavs, fs = self._model.generate_voice_clone(
                 text=text,
-                language=self._language,
-                gpt_cond_latent=self._gpt_cond_latent,
-                speaker_embedding=self._speaker_embedding,
-                temperature=_TEMPERATURE,
-                repetition_penalty=_REPETITION_PENALTY,
-                length_penalty=_LENGTH_PENALTY,
-                speed=self._speed,
+                ref_audio=self._speaker_wav,
+                x_vector_only_mode=True,
             )
         else:
-            # No reference WAV — use the first available built-in speaker.
-            # XTTS v2 is a multi-speaker model; a speaker name is required
-            # when no speaker_wav / embedding is provided.
-            speaker = self._default_speaker()
-            logger.info("No speaker_wav provided; using built-in speaker: %s", speaker)
-            out = self._tts.tts(
+            wavs, fs = self._model.generate_custom_voice(
                 text=text,
-                speaker=speaker,
-                language=self._language,
-                speed=self._speed,
+                speaker=self._speaker,
+                instruct=self._instruction,
             )
-            if isinstance(out, list):
-                return np.array(out, dtype=np.float32)
-            return np.array(out, dtype=np.float32)
 
-        wav = out.get("wav") if isinstance(out, dict) else out
-        if isinstance(wav, torch.Tensor):
-            wav = wav.squeeze().cpu().numpy()
-        return np.array(wav, dtype=np.float32)
-
-    def _synthesize_fallback(self, text: str) -> np.ndarray:
-        """Synthesize using the Tacotron2-DDC fallback model.
-
-        Args:
-            text: Input text chunk.
-
-        Returns:
-            Float32 NumPy array of audio samples.
-        """
-        wav = self._tts.tts(text=text)
-        return np.array(wav, dtype=np.float32)
+        audio = wavs[0]
+        if isinstance(audio, torch.Tensor):
+            audio = audio.squeeze().cpu().numpy()
+        return np.array(audio, dtype=np.float32)

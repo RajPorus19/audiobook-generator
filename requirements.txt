@@ -1,5 +1,5 @@
-coqui-tts>=0.25.0
-transformers>=4.30.0,<4.46.0
+qwen-tts
+soundfile
 torch>=2.0.0
 torchaudio>=2.0.0
 numpy
