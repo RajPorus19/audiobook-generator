@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+
+# Audio / video outputs
+*.mp3
+*.wav
+*.mp4
+*.mkv
+*.avi
+
+# Alignment cache
+*.align_*.json
+
+# Font files (downloaded by setup.sh)
+fonts/
+
+# Model weights (downloaded at runtime)
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp
