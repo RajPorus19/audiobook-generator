@@ -215,7 +215,7 @@ class Aligner:
         """
         # Version string — bump whenever the extraction or mapping logic changes
         # so that stale caches are automatically invalidated.
-        _VERSION = b"v2-sentence-level"
+        _VERSION = b"v3-global-alignment"
         h = hashlib.sha256()
         h.update(_VERSION)
         h.update(audio_path.encode())
@@ -430,9 +430,18 @@ class Aligner:
     ) -> List[SentenceTimestamp]:
         """Map word-level timestamps to their parent sentences.
 
-        Uses a sequential sliding-window matcher: for each ASR word, scan forward
-        up to 12 positions in the original word list to find a match.  The slack
-        absorbs minor transcription differences without losing track of position.
+        Uses ``difflib.SequenceMatcher`` for a **global** alignment between the
+        normalised original-text word list and the WhisperX ASR word list.
+        Global alignment prevents the drift that a sliding-window approach
+        accumulates over long texts — a mismatch early on (e.g. an expanded
+        number) no longer shifts every subsequent timestamp.
+
+        Strategy:
+          - ``equal`` blocks  → high-confidence direct timestamp assignment.
+          - ``replace`` blocks → attempt prefix matching (handles "forty" ↔
+            "fortytwo") and assign timestamps where the normalised forms agree.
+          - Remaining unmatched sentences are filled by
+            :meth:`_interpolate_missing`.
 
         Args:
             word_segments: Word-level output from WhisperX alignment.
@@ -441,9 +450,9 @@ class Aligner:
         Returns:
             List of :class:`SentenceTimestamp` with ``start_ms`` / ``end_ms``
             filled in for sentences that received at least one matched word.
-            Sentences with no matches have their times left as 0 (callers should
-            run :meth:`_interpolate_missing` after this).
         """
+        from difflib import SequenceMatcher  # noqa: PLC0415
+
         # Build flat (sentence_idx, normalised_word) list from original text.
         orig_words: List[Tuple[int, str]] = []
         for sent_idx, sentence in enumerate(sentences):
@@ -452,34 +461,44 @@ class Aligner:
                 if norm:
                     orig_words.append((sent_idx, norm))
 
+        # Filter ASR segments that have valid timestamps and non-empty words.
+        valid_segs: List[Tuple[Dict[str, Any], str]] = []
+        for ws in word_segments:
+            norm = _normalize_word(ws.get("word", ""))
+            if norm and "start" in ws and "end" in ws:
+                valid_segs.append((ws, norm))
+
+        if not orig_words or not valid_segs:
+            return self._build_empty_timestamps(sentences)
+
+        orig_norms = [norm for _, norm in orig_words]
+        asr_norms = [norm for _, norm in valid_segs]
+
         sent_starts: Dict[int, int] = {}
         sent_ends: Dict[int, int] = {}
 
-        orig_ptr = 0
-        for ws in word_segments:
-            asr_norm = _normalize_word(ws.get("word", ""))
-            if not asr_norm:
-                continue
+        def _assign(orig_i: int, asr_j: int) -> None:
+            """Assign the timestamp at asr_j to the sentence owning orig_i."""
+            sent_idx = orig_words[orig_i][0]
+            ws = valid_segs[asr_j][0]
+            s_ms = int(ws["start"] * 1000)
+            e_ms = int(ws["end"] * 1000)
+            if sent_idx not in sent_starts:
+                sent_starts[sent_idx] = s_ms
+            sent_ends[sent_idx] = e_ms
 
-            start_ms = int(ws.get("start", 0.0) * 1000)
-            end_ms = int(ws.get("end", 0.0) * 1000)
-
-            # Scan ahead for a matching original word.
-            matched = False
-            for slack in range(12):
-                if orig_ptr + slack >= len(orig_words):
-                    break
-                sent_idx, orig_norm = orig_words[orig_ptr + slack]
-                if _words_match(asr_norm, orig_norm):
-                    orig_ptr += slack + 1
-                    if sent_idx not in sent_starts:
-                        sent_starts[sent_idx] = start_ms
-                    sent_ends[sent_idx] = end_ms
-                    matched = True
-                    break
-
-            if not matched and orig_ptr < len(orig_words):
-                orig_ptr += 1  # Don't stall on unmatched ASR tokens.
+        sm = SequenceMatcher(None, orig_norms, asr_norms, autojunk=False)
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "equal":
+                for i, j in zip(range(i1, i2), range(j1, j2)):
+                    _assign(i, j)
+            elif tag == "replace":
+                # Pairs from replace blocks may be expanded forms of each other
+                # (e.g. "fortytwo" in orig vs "forty" + "two" in ASR).  Try
+                # prefix matching on aligned pairs.
+                for i, j in zip(range(i1, i2), range(j1, j2)):
+                    if _words_match(orig_words[i][1], valid_segs[j][1]):
+                        _assign(i, j)
 
         result: List[SentenceTimestamp] = []
         for sent_idx, sentence in enumerate(sentences):
@@ -497,11 +516,26 @@ class Aligner:
 
         matched_count = sum(1 for ts in result if ts.start_ms > 0 or ts.end_ms > 0)
         logger.info(
-            "Matched %d / %d sentences to audio timestamps.",
+            "Matched %d / %d sentences to audio timestamps (global alignment).",
             matched_count,
             len(sentences),
         )
         return result
+
+    @staticmethod
+    def _build_empty_timestamps(sentences: List[str]) -> List[SentenceTimestamp]:
+        """Return zero-filled timestamps when no word segments are available.
+
+        Args:
+            sentences: Sentence strings.
+
+        Returns:
+            List of :class:`SentenceTimestamp` with all times set to 0.
+        """
+        return [
+            SentenceTimestamp(index=i, text=s, start_ms=0, end_ms=0)
+            for i, s in enumerate(sentences)
+        ]
 
     @staticmethod
     def _interpolate_missing(
